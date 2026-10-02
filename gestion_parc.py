@@ -48,8 +48,14 @@ os.makedirs(PHOTOS_DIR, exist_ok=True)
 # ============================================
 # BASE DE DONNÉES SQLITE
 # ============================================
+def _add_column_if_missing(conn, table, column, definition):
+    """Migration légère : ajoute une colonne si absente (compatible anciennes bases)."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
 def init_db():
-    """Crée la base de données avec les nouvelles colonnes photo"""
+    """Crée/migre la base de données (photos, statut véhicule, retour, notes...)."""
     conn = sqlite3.connect(DB_FILE)
     conn.execute("PRAGMA foreign_keys = ON;") # Activation des clés étrangères
     c = conn.cursor()
@@ -125,6 +131,44 @@ def init_db():
         )
     ''')
 
+    # --- Migrations douces pour les bases existantes ---
+    _add_column_if_missing(conn, 'vehicules', 'statut', "TEXT DEFAULT 'Disponible'")
+    _add_column_if_missing(conn, 'vehicules', 'kilometrage', "REAL")
+    _add_column_if_missing(conn, 'locations', 'date_retour_reelle', "TEXT")
+    _add_column_if_missing(conn, 'locations', 'acompte', "REAL DEFAULT 0")
+    _add_column_if_missing(conn, 'locations', 'notes', "TEXT")
+    _add_column_if_missing(conn, 'personnel', 'nom', "TEXT")
+    _add_column_if_missing(conn, 'personnel', 'poste', "TEXT")
+
+    # Index d'performance
+    c.execute('CREATE INDEX IF NOT EXISTS idx_loc_vehicule ON locations(vehicule_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_loc_dates ON locations(date_debut, date_fin)')
+
+    # Statistiques mensuelles (6 derniers mois) — revenus vs charges
+    try:
+        conn.execute("DROP VIEW IF EXISTS stats_mensuelles")
+        conn.execute('''
+            CREATE VIEW stats_mensuelles AS
+            SELECT mois,
+                   SUM(revenus)  AS revenus,
+                   SUM(charges)  AS charges,
+                   SUM(revenus) - SUM(charges) AS resultat
+            FROM (
+                SELECT substr(date_debut, 1, 7) AS mois, total AS revenus, 0 AS charges FROM locations
+                UNION ALL
+                SELECT substr(date_charge, 1, 7), 0, montant FROM charges_fixes
+                UNION ALL
+                SELECT substr(date_charge, 1, 7), 0, montant FROM charges_variables
+                UNION ALL
+                SELECT substr(date_paie, 1, 7), 0, montant FROM personnel
+            )
+            GROUP BY mois
+            ORDER BY mois DESC
+            LIMIT 6
+        ''')
+    except Exception:
+        pass
+
     conn.commit()
     conn.close()
     print(f"✅ Base de données prête : {os.path.abspath(DB_FILE)}")
@@ -133,14 +177,23 @@ def init_db():
 # BACKUP AUTOMATIQUE
 # ============================================
 def create_backup():
-    """Crée une copie de sauvegarde datée"""
+    """Crée une sauvegarde cohérente (API sqlite3 Backup, pas de copie à chaud)."""
     if not os.path.exists(DB_FILE):
         return
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     backup_name = f"flotte_backup_{timestamp}.db"
     backup_path = os.path.join(BACKUP_DIR, backup_name)
 
-    shutil.copy2(DB_FILE, backup_path)
+    try:
+        src = sqlite3.connect(DB_FILE)
+        dst = sqlite3.connect(backup_path)
+        with dst:
+            src.backup(dst)
+        dst.close()
+        src.close()
+    except Exception as e:
+        print(f"⚠️ Échec du backup : {e}")
+        return None
     clean_old_backups()
     return backup_path
 
@@ -245,10 +298,12 @@ class Database:
         c = self.conn.cursor()
         c.execute('''
             INSERT INTO vehicules (marque, modele, immatriculation, categorie, 
-                                  prix_jour, date_assurance, date_visite, date_agrement, photo_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  prix_jour, date_assurance, date_visite, date_agrement, photo_path,
+                                  statut, kilometrage)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (data['marque'], data['modele'], data['immat'], data['categorie'],
-              data['prix'], data['assurance'], data['visite'], data['agrement'], data.get('photo_path')))
+              data['prix'], data['assurance'], data['visite'], data['agrement'], data.get('photo_path'),
+              data.get('statut', 'Disponible'), data.get('kilometrage')))
         self.conn.commit()
         return c.lastrowid 
 
@@ -256,11 +311,16 @@ class Database:
         self.conn.execute('''
             UPDATE vehicules SET marque=?, modele=?, immatriculation=?, categorie=?,
                                prix_jour=?, date_assurance=?, date_visite=?, date_agrement=?,
-                               photo_path=COALESCE(?, photo_path)
+                               photo_path=COALESCE(?, photo_path),
+                               statut=COALESCE(?, statut), kilometrage=COALESCE(?, kilometrage)
             WHERE id=?
         ''', (data['marque'], data['modele'], data['immat'], data['categorie'],
               data['prix'], data['assurance'], data['visite'], data['agrement'], 
-              data.get('photo_path'), id))
+              data.get('photo_path'), data.get('statut'), data.get('kilometrage'), id))
+        self.conn.commit()
+
+    def set_vehicle_statut(self, vehicle_id, statut):
+        self.conn.execute("UPDATE vehicules SET statut = ? WHERE id = ?", (statut, vehicle_id))
         self.conn.commit()
 
     def update_vehicle_photo(self, id, photo_path):
@@ -280,22 +340,69 @@ class Database:
     # --- LOCATIONS ---
     def get_locations(self):
         return self.conn.execute('''
-            SELECT l.*, v.marque, v.modele, v.immatriculation, v.photo_path
+            SELECT l.*, v.marque, v.modele, v.immatriculation, v.photo_path,
+                   CASE WHEN l.date_retour_reelle IS NOT NULL THEN 'Terminée'
+                        WHEN date('now') BETWEEN l.date_debut AND l.date_fin THEN 'En cours'
+                        WHEN date('now') < l.date_debut THEN 'À venir'
+                        ELSE 'Retard' END AS statut_loc
             FROM locations l
             JOIN vehicules v ON l.vehicule_id = v.id
-            ORDER BY l.date_location DESC
+            ORDER BY l.date_debut DESC
         ''').fetchall()
+
+    def get_location(self, id):
+        return self.conn.execute("SELECT * FROM locations WHERE id = ?", (id,)).fetchone()
+
+    def count_active_locations(self):
+        """Locations en cours aujourd'hui (= véhicules loués)."""
+        return self.conn.execute('''
+            SELECT COUNT(*) FROM locations
+            WHERE date_retour_reelle IS NULL AND date('now') BETWEEN date_debut AND date_fin
+        ''').fetchone()[0]
+
+    def has_date_conflict(self, vehicule_id, debut, fin, exclude_id=None):
+        """Vérifie si le véhicule est déjà loué sur cette période."""
+        q = '''
+            SELECT COUNT(*) FROM locations
+            WHERE vehicule_id = ? AND date_retour_reelle IS NULL
+              AND date_debut <= ? AND date_fin >= ?
+        '''
+        params = [vehicule_id, fin, debut]
+        if exclude_id:
+            q += " AND id != ?"
+            params.append(exclude_id)
+        return self.conn.execute(q, params).fetchone()[0] > 0
 
     def add_location(self, data):
         c = self.conn.cursor()
         c.execute('''
             INSERT INTO locations (date_location, vehicule_id, client, date_debut, 
-                                 date_fin, jours, prix_jour, total, paiement)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 date_fin, jours, prix_jour, total, paiement, acompte, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (data['date'], data['vehicule_id'], data['client'], data['debut'],
-              data['fin'], data['jours'], data['prix'], data['total'], data['paiement']))
+              data['fin'], data['jours'], data['prix'], data['total'], data['paiement'],
+              data.get('acompte', 0), data.get('notes')))
+        # Marquer le véhicule comme loué si la location couvre aujourd'hui
+        try:
+            today = datetime.now().strftime('%Y-%m-%d')
+            if data['debut'] <= today <= data['fin']:
+                self.set_vehicle_statut(data['vehicule_id'], 'Loué')
+        except Exception:
+            pass
         self.conn.commit()
         return c.lastrowid
+
+    def cloturer_location(self, loc_id):
+        """Enregistre le retour réel du véhicule et rend le véhicule disponible."""
+        loc = self.get_location(loc_id)
+        if not loc:
+            return False
+        self.conn.execute(
+            "UPDATE locations SET date_retour_reelle = date('now') WHERE id = ?", (loc_id,))
+        self.conn.execute(
+            "UPDATE vehicules SET statut = 'Disponible' WHERE id = ?", (loc['vehicule_id'],))
+        self.conn.commit()
+        return True
 
     def delete_location(self, id):
         self.conn.execute("DELETE FROM locations WHERE id=?", (id,))
@@ -304,6 +411,13 @@ class Database:
     def get_total_locations(self):
         result = self.conn.execute("SELECT COALESCE(SUM(total), 0) FROM locations").fetchone()
         return result[0]
+
+    def get_monthly_stats(self):
+        """Revenus/charges des 6 derniers mois (ordre chronologique)."""
+        rows = self.conn.execute(
+            "SELECT mois, revenus, charges, resultat FROM stats_mensuelles ORDER BY mois ASC"
+        ).fetchall()
+        return rows
 
     # --- CHARGES ---
     def get_charges_fixes(self):
@@ -355,11 +469,16 @@ class Database:
     def add_personnel(self, data):
         c = self.conn.cursor()
         c.execute('''
-            INSERT INTO personnel (date_paie, montant, description)
-            VALUES (?, ?, ?)
-        ''', (data['date'], data['montant'], data.get('description')))
+            INSERT INTO personnel (date_paie, montant, description, nom, poste)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (data['date'], data['montant'], data.get('description'),
+              data.get('nom'), data.get('poste')))
         self.conn.commit()
         return c.lastrowid
+
+    def delete_personnel(self, id):
+        self.conn.execute("DELETE FROM personnel WHERE id=?", (id,))
+        self.conn.commit()
 
     # --- ALERTES ---
     def get_alertes(self):
@@ -516,19 +635,70 @@ class Application:
         kpi_frame.pack(fill=X, pady=10)
         
         nb_veh = len(self.db.get_vehicules())
-        nb_loc = len(self.db.get_locations())
+        nb_loc_en_cours = self.db.count_active_locations()
         total_loc = self.db.get_total_locations() or 0
         total_charges, _, _, _ = self.db.get_total_charges()
         result = total_loc - total_charges
         alertes = len(self.db.get_alertes())
         
         self.create_kpi_card(kpi_frame, "VÉHICULES", str(nb_veh), '#3498db', '🚗')
-        self.create_kpi_card(kpi_frame, "LOCATIONS", str(nb_loc), '#0d8b6d', '🤝')
+        self.create_kpi_card(kpi_frame, "LOCATIONS EN COURS", str(nb_loc_en_cours), '#0d8b6d', '🤝')
         self.create_kpi_card(kpi_frame, "REVENUS", f"{total_loc:,.0f} DH", '#9b59b6', '💰')
         self.create_kpi_card(kpi_frame, "CHARGES", f"{total_charges:,.0f} DH", '#dc3545', '📉')
         self.create_kpi_card(kpi_frame, "RÉSULTAT", f"{result:,.0f} DH", 
                             '#0d8b6d' if result >= 0 else '#dc3545', '💵')
         self.create_kpi_card(kpi_frame, "ALERTES", str(alertes), '#f39c12', '⚠️')
+
+        # --- Graphique Revenus vs Charges (6 derniers mois) ---
+        stats = self.db.get_monthly_stats()
+        if stats:
+            chart_card = Frame(self.main_frame, bg='white', bd=1, relief='solid',
+                               highlightbackground='#e1e8ed', highlightthickness=1)
+            chart_card.pack(fill=X, pady=(5, 10), ipady=8)
+            Frame(chart_card, bg='#9b59b6', height=4).pack(fill=X)
+            Label(chart_card, text="📈 Revenus vs Charges — 6 derniers mois",
+                  bg='white', fg=self.colors['primary'],
+                  font=('Segoe UI', 13, 'bold')).pack(anchor='w', padx=20, pady=(12, 4))
+
+            canvas = Canvas(chart_card, bg='white', height=170, highlightthickness=0)
+            canvas.pack(fill=X, padx=20, pady=(0, 12))
+
+            def draw_chart(event):
+                canvas.delete('all')
+                w, h = event.width, 160
+                n = len(stats)
+                max_val = max([max(s['revenus'] or 0, s['charges'] or 0) for s in stats] + [1])
+                group_w = w / max(n, 1)
+                bar_w = min(group_w * 0.28, 46)
+                months_fr = ['jan', 'fév', 'mar', 'avr', 'mai', 'jun',
+                             'jul', 'aoû', 'sep', 'oct', 'nov', 'déc']
+                for i, s in enumerate(stats):
+                    cx = group_w * (i + 0.5)
+                    rh = (s['revenus'] or 0) / max_val * (h - 40)
+                    ch = (s['charges'] or 0) / max_val * (h - 40)
+                    canvas.create_rectangle(cx - bar_w - 3, h - rh, cx - 3, h,
+                                            fill='#0d8b6d', width=0)
+                    canvas.create_rectangle(cx + 3, h - ch, cx + bar_w + 3, h,
+                                            fill='#dc3545', width=0)
+                    try:
+                        y, m = s['mois'].split('-')
+                        lbl = f"{months_fr[int(m)-1]} {y[2:]}"
+                    except Exception:
+                        lbl = s['mois']
+                    canvas.create_text(cx, h + 0, text=lbl, font=('Segoe UI', 9),
+                                       fill='#7f8c8d', anchor='n')
+                    canvas.create_text(cx - bar_w/2 - 3, h - rh - 2,
+                                       text=f"{int(s['revenus'] or 0):,} DH".replace(',', ' '),
+                                       font=('Segoe UI', 8), fill='#0d8b6d', anchor='s')
+                canvas.create_line(0, h, w, h, fill='#e1e8ed')
+            canvas.bind('<Configure>', draw_chart)
+
+            legend = Frame(chart_card, bg='white')
+            legend.pack(anchor='w', padx=20, pady=(0, 10))
+            Label(legend, text="■ Revenus", bg='white', fg='#0d8b6d',
+                  font=('Segoe UI', 9, 'bold')).pack(side=LEFT, padx=(0, 15))
+            Label(legend, text="■ Charges", bg='white', fg='#dc3545',
+                  font=('Segoe UI', 9, 'bold')).pack(side=LEFT)
         
         alert_frame = Frame(self.main_frame, bg='white', bd=1, relief='solid',
                            highlightbackground='#e1e8ed', highlightthickness=1)
@@ -542,6 +712,10 @@ class Application:
         Label(header_alert, text="⚠️ Alertes Prioritaires", 
               bg='white', fg=self.colors['primary'],
               font=('Segoe UI', 16, 'bold')).pack(side=LEFT)
+
+        Button(header_alert, text="Voir toutes les alertes →", command=self.show_alertes,
+               bg='white', fg=self.colors['primary'], font=('Segoe UI', 9, 'bold'),
+               bd=0, cursor='hand2').pack(side=RIGHT)
         
         alertes_list = self.db.get_alertes()[:5]
         if not alertes_list:
@@ -608,6 +782,16 @@ class Application:
         self.veh_filter_cat.set('Toutes')
         self.veh_filter_cat.pack(side=LEFT, padx=10)
         self.veh_filter_cat.bind('<<ComboboxSelected>>', lambda e: self.refresh_vehicles_list())
+
+        Label(filter_frame, text="Statut : ", bg=self.colors['bg'],
+              font=('Segoe UI', 10)).pack(side=LEFT, padx=(20, 0))
+
+        self.veh_filter_statut = ttk.Combobox(filter_frame,
+                                              values=['Tous', 'Disponible', 'Loué', 'Maintenance', 'Vendu'],
+                                              width=13, state='readonly')
+        self.veh_filter_statut.set('Tous')
+        self.veh_filter_statut.pack(side=LEFT, padx=10)
+        self.veh_filter_statut.bind('<<ComboboxSelected>>', lambda e: self.refresh_vehicles_list())
         
         canvas = Canvas(self.main_frame, bg=self.colors['bg'], highlightthickness=0)
         scrollbar = ttk.Scrollbar(self.main_frame, orient=VERTICAL, command=canvas.yview)
@@ -650,6 +834,7 @@ class Application:
         vehicules = self.db.get_vehicules()
         search = self.veh_search.get().lower()
         cat = self.veh_filter_cat.get()
+        statut = self.veh_filter_statut.get()
         
         filtered = []
         for v in vehicules:
@@ -658,6 +843,10 @@ class Application:
                 continue
             if cat != 'Toutes' and v['categorie'] != cat:
                 continue
+            if statut != 'Tous':
+                vs = (v['statut'] if 'statut' in v.keys() else None) or 'Disponible'
+                if vs != statut:
+                    continue
             filtered.append(v)
         
         if not filtered:
@@ -734,6 +923,26 @@ class Application:
         Label(info, text=f"🆔 {v['immatriculation']}", 
               bg='white', fg='#7f8c8d',
               font=('Segoe UI', 11)).pack(anchor='w', pady=(8, 0))
+
+        # Badge de statut + kilométrage
+        try:
+            v_statut = (v['statut'] if 'statut' in v.keys() else None) or 'Disponible'
+        except Exception:
+            v_statut = 'Disponible'
+        statut_colors = {'Disponible': '#0d8b6d', 'Loué': '#3498db',
+                         'Maintenance': '#f39c12', 'Vendu': '#7f8c8d'}
+        Label(info, text=f"● {v_statut}",
+              bg='white', fg=statut_colors.get(v_statut, '#7f8c8d'),
+              font=('Segoe UI', 10, 'bold')).pack(anchor='w', pady=(2, 0))
+
+        try:
+            km = v['kilometrage'] if 'kilometrage' in v.keys() else None
+        except Exception:
+            km = None
+        if km:
+            Label(info, text=f"🛣️ {km:,.0f} km".replace(',', ' '),
+                  bg='white', fg='#7f8c8d',
+                  font=('Segoe UI', 9)).pack(anchor='w')
         
         Label(info, text=f"💰 {v['prix_jour']:,.0f} DH/jour", 
               bg='white', fg=self.colors['secondary'],
@@ -864,6 +1073,24 @@ class Application:
                                        font=('Segoe UI', 11), state='readonly')
         self.cat_combo.set('Economique')
         self.cat_combo.pack(fill=X, ipady=4)
+
+        # Statut + kilométrage
+        statut_km_frame = Frame(form)
+        statut_km_frame.pack(fill=X, pady=(10, 0))
+
+        col_s = Frame(statut_km_frame)
+        col_s.pack(side=LEFT, fill=X, expand=True)
+        Label(col_s, text="Statut", font=('Segoe UI', 11), anchor='w').pack(anchor='w', pady=(0, 5))
+        self.statut_combo = ttk.Combobox(col_s, values=['Disponible', 'Loué', 'Maintenance', 'Vendu'],
+                                         font=('Segoe UI', 11), state='readonly')
+        self.statut_combo.set('Disponible')
+        self.statut_combo.pack(fill=X, ipady=4)
+
+        col_k = Frame(statut_km_frame)
+        col_k.pack(side=LEFT, fill=X, expand=True, padx=(15, 0))
+        Label(col_k, text="Kilométrage", font=('Segoe UI', 11), anchor='w').pack(anchor='w', pady=(0, 5))
+        self.km_entry = Entry(col_k, font=('Segoe UI', 12), relief='solid', bd=1)
+        self.km_entry.pack(fill=X, ipady=6)
         
         dates_frame = Frame(form)
         dates_frame.pack(fill=X, pady=15)
@@ -917,12 +1144,28 @@ class Application:
             except Exception:
                 pass
 
+    def _read_km_from_form(self):
+        """Retourne le kilométrage saisi (float ou None) — lève ValueError si invalide."""
+        val = self.km_entry.get().strip().replace(' ', '').replace(',', '.')
+        if not val:
+            return None
+        km = float(val)
+        if km < 0:
+            raise ValueError("Le kilométrage ne peut pas être négatif.")
+        return km
+
     def save_new_vehicule(self, dialog):
         try:
             prix_val = self.entries['prix'].get().strip().replace(',', '.')
             prix_jour = float(prix_val) if prix_val else 0.0
         except ValueError:
             messagebox.showerror("Erreur de saisie", "Le prix journalier doit être un nombre valide.")
+            return
+
+        try:
+            kilometrage = self._read_km_from_form()
+        except ValueError:
+            messagebox.showerror("Erreur de saisie", "Le kilométrage doit être un nombre valide.")
             return
 
         try:
@@ -935,7 +1178,9 @@ class Application:
                 'assurance': self.date_entries['assurance'].get() or None,
                 'visite': self.date_entries['visite'].get() or None,
                 'agrement': self.date_entries['agrement'].get() or None,
-                'photo_path': None
+                'photo_path': None,
+                'statut': self.statut_combo.get(),
+                'kilometrage': kilometrage
             }
             
             if not all([data['marque'], data['modele'], data['immat']]):
@@ -1028,6 +1273,28 @@ class Application:
                                        font=('Segoe UI', 11), state='readonly')
         self.cat_combo.set(v['categorie'] if v['categorie'] in ['Economique', 'Compacte', 'Premium'] else 'Economique')
         self.cat_combo.pack(fill=X, ipady=4)
+
+        # Statut + kilométrage
+        statut_km_frame = Frame(form)
+        statut_km_frame.pack(fill=X, pady=(10, 0))
+
+        col_s = Frame(statut_km_frame)
+        col_s.pack(side=LEFT, fill=X, expand=True)
+        Label(col_s, text="Statut", font=('Segoe UI', 11), anchor='w').pack(anchor='w', pady=(0, 5))
+        self.statut_combo = ttk.Combobox(col_s, values=['Disponible', 'Loué', 'Maintenance', 'Vendu'],
+                                         font=('Segoe UI', 11), state='readonly')
+        cur_statut = (v['statut'] if 'statut' in v.keys() else None) or 'Disponible'
+        self.statut_combo.set(cur_statut if cur_statut in ['Disponible', 'Loué', 'Maintenance', 'Vendu'] else 'Disponible')
+        self.statut_combo.pack(fill=X, ipady=4)
+
+        col_k = Frame(statut_km_frame)
+        col_k.pack(side=LEFT, fill=X, expand=True, padx=(15, 0))
+        Label(col_k, text="Kilométrage", font=('Segoe UI', 11), anchor='w').pack(anchor='w', pady=(0, 5))
+        self.km_entry = Entry(col_k, font=('Segoe UI', 12), relief='solid', bd=1)
+        cur_km = v['kilometrage'] if 'kilometrage' in v.keys() else None
+        if cur_km:
+            self.km_entry.insert(0, str(int(cur_km)))
+        self.km_entry.pack(fill=X, ipady=6)
         
         dates_frame = Frame(form)
         dates_frame.pack(fill=X, pady=15)
@@ -1070,6 +1337,12 @@ class Application:
             return
 
         try:
+            kilometrage = self._read_km_from_form()
+        except ValueError:
+            messagebox.showerror("Erreur de saisie", "Le kilométrage doit être un nombre valide.")
+            return
+
+        try:
             data = {
                 'marque': self.entries['marque'].get().strip(),
                 'modele': self.entries['modele'].get().strip(),
@@ -1079,7 +1352,9 @@ class Application:
                 'assurance': self.date_entries['assurance'].get() or None,
                 'visite': self.date_entries['visite'].get() or None,
                 'agrement': self.date_entries['agrement'].get() or None,
-                'photo_path': None
+                'photo_path': None,
+                'statut': self.statut_combo.get(),
+                'kilometrage': kilometrage
             }
             
             if not all([data['marque'], data['modele'], data['immat']]):
@@ -1125,6 +1400,10 @@ class Application:
               bg=self.colors['bg'], fg=self.colors['primary'],
               font=('Segoe UI', 28, 'bold')).pack(side=LEFT)
         
+        Button(header, text="📄 Export CSV", command=self.export_locations_csv,
+               bg='#3498db', fg='white', font=('Segoe UI', 11),
+               bd=0, padx=20, pady=10, cursor='hand2').pack(side=RIGHT, padx=(0, 10))
+
         Button(header, text="+ Nouvelle location", command=self.add_location_dialog,
                bg=self.colors['secondary'], fg='white', font=('Segoe UI', 11),
                bd=0, padx=25, pady=10, cursor='hand2').pack(side=RIGHT)
@@ -1134,37 +1413,141 @@ class Application:
         tree_frame.pack(fill=BOTH, expand=True)
         
         Frame(tree_frame, bg=self.colors['primary'], height=4).pack(fill=X)
+
+        # Barre d'actions sur sélection
+        actions_bar = Frame(tree_frame, bg='white')
+        actions_bar.pack(fill=X, padx=10, pady=(8, 0))
+
+        Button(actions_bar, text="✅ Clôturer (retour véhicule)",
+               command=self.cloturer_location_selected,
+               bg=self.colors['secondary'], fg='white', font=('Segoe UI', 10),
+               bd=0, padx=15, pady=6, cursor='hand2').pack(side=LEFT, padx=(0, 8))
+
+        Button(actions_bar, text="🗑️ Supprimer la location",
+               command=self.delete_location_selected,
+               bg='#fdeaea', fg=self.colors['danger'], font=('Segoe UI', 10),
+               bd=0, padx=15, pady=6, cursor='hand2').pack(side=LEFT)
+
+        Label(actions_bar, text="Astuce : double-cliquez sur une ligne pour la clôturer.",
+              bg='white', fg='#7f8c8d', font=('Segoe UI', 9)).pack(side=RIGHT)
         
-        columns = ('ID', 'Date', 'Véhicule', 'Client', 'Début', 'Fin', 'Jours', 'Total', 'Paiement')
-        tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=20)
+        columns = ('ID', 'Statut', 'Véhicule', 'Client', 'Début', 'Fin', 'Retour réel', 'Jours', 'Total', 'Paiement')
+        tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=18)
+        self.locations_tree = tree
         
         style = ttk.Style()
         style.configure("Treeview", font=('Segoe UI', 10), rowheight=35)
         style.configure("Treeview.Heading", font=('Segoe UI', 10, 'bold'), background=self.colors['bg'])
+        style.configure('Loc.Turnaround.Horizontal.TProgressbar', troughcolor='#f4f6f9', background='#0d8b6d')
+
+        tree.tag_configure('encours', background='#e8f4fd')
+        tree.tag_configure('retard', background='#fdeaea')
+        tree.tag_configure('avenir', background='#fef9e7')
+        tree.tag_configure('terminee', foreground='#95a5a6')
         
         for col in columns:
             tree.heading(col, text=col)
-            width = 60 if col == 'ID' else 100 if col in ('Jours', 'Paiement') else 140
-            tree.column(col, width=width, anchor='center' if col in ('ID', 'Jours', 'Total') else 'w')
+            width = 55 if col == 'ID' else 100 if col in ('Jours', 'Paiement', 'Statut') else 140
+            tree.column(col, width=width, anchor='center' if col in ('ID', 'Jours', 'Total', 'Statut') else 'w')
         
         scrollbar = ttk.Scrollbar(tree_frame, orient=VERTICAL, command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=RIGHT, fill=Y)
         tree.pack(fill=BOTH, expand=True, padx=10, pady=10)
+
+        tree.bind('<Double-1>', lambda e: self.cloturer_location_selected())
         
         locations = self.db.get_locations()
+        tag_map = {'En cours': 'encours', 'Retard': 'retard',
+                   'À venir': 'avenir', 'Terminée': 'terminee'}
         for l in locations:
-            tree.insert('', END, values=(
-                l['id'], l['date_location'],  
+            retour_reel = l['date_retour_reelle'] if 'date_retour_reelle' in l.keys() else None
+            tree.insert('', END, iid=str(l['id']), tags=(tag_map.get(l['statut_loc'], ''),), values=(
+                l['id'], l['statut_loc'],
                 f"{l['marque']} {l['modele']}",
                 l['client'], l['date_debut'], l['date_fin'],
+                retour_reel or '-',
                 l['jours'], f"{l['total']:,.0f} DH", l['paiement']
             ))
+
+        # --- Taux de rotation du parc ---
+        nb_veh = max(len(self.db.get_vehicules()), 1)
+        jours_parc = sum((l['jours'] or 0) for l in locations)
+        rotation = jours_parc / nb_veh
+        rot_frame = Frame(self.main_frame, bg='white', bd=1, relief='solid',
+                          highlightbackground='#e1e8ed', highlightthickness=1)
+        rot_frame.pack(fill=X, pady=(12, 0))
+        inner_rot = Frame(rot_frame, bg='white')
+        inner_rot.pack(fill=X, padx=20, pady=12)
+        Label(inner_rot, text=f"🔄 Rotation du parc : {rotation:,.0f} jour(s)-véhicule loué par véhicule"
+              .replace(',', ' '),
+              bg='white', fg=self.colors['primary'],
+              font=('Segoe UI', 11, 'bold')).pack(anchor='w')
+        pct = min(100, int(rotation / max(nb_veh * 30, 1) * 100 * 3))  # jauge indicative
+        progress = ttk.Progressbar(inner_rot, value=max(pct, 2), maximum=100, length=400)
+        progress.pack(anchor='w', pady=(6, 0), fill=X)
         
         total = self.db.get_total_locations()
         Label(self.main_frame, text=f"💰 TOTAL = {total:,.0f} DH", 
               bg=self.colors['bg'], fg=self.colors['primary'],
               font=('Segoe UI', 16, 'bold')).pack(anchor='e', pady=15)
+
+    def _selected_location_id(self):
+        sel = self.locations_tree.selection()
+        if not sel:
+            messagebox.showwarning("Sélection", "Veuillez sélectionner une location dans le tableau.")
+            return None
+        return int(sel[0])
+
+    def cloturer_location_selected(self):
+        loc_id = self._selected_location_id()
+        if loc_id is None:
+            return
+        loc = self.db.get_location(loc_id)
+        if not loc:
+            return
+        if loc['date_retour_reelle']:
+            messagebox.showinfo("Déjà clôturée", "Cette location est déjà terminée.")
+            return
+        if messagebox.askyesno("Confirmer le retour",
+                               f"Enregistrer le retour du véhicule pour la location #{loc_id}\n"
+                               f"({loc['client']} — {loc['date_debut']} → {loc['date_fin']}) ?"):
+            self.db.cloturer_location(loc_id)
+            messagebox.showinfo("Succès", "Retour enregistré, véhicule remis disponible.")
+            self.show_locations()
+
+    def delete_location_selected(self):
+        loc_id = self._selected_location_id()
+        if loc_id is None:
+            return
+        if messagebox.askyesno("Confirmation", f"Supprimer définitivement la location #{loc_id} ?"):
+            self.db.delete_location(loc_id)
+            self.show_locations()
+
+    def export_locations_csv(self):
+        """Export des locations au format CSV (compatible Excel)."""
+        path = filedialog.asksaveasfilename(
+            title="Exporter les locations",
+            defaultextension=".csv",
+            initialfile=f"locations_{datetime.now().strftime('%Y-%m-%d')}.csv",
+            filetypes=[("Fichier CSV", "*.csv")]
+        )
+        if not path:
+            return
+        try:
+            import csv
+            with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+                w = csv.writer(f, delimiter=';')
+                w.writerow(['ID', 'Date location', 'Statut', 'Marque', 'Modele', 'Immatriculation',
+                            'Client', 'Debut', 'Fin', 'Retour reel', 'Jours', 'Prix/jour', 'Total', 'Paiement'])
+                for l in self.db.get_locations():
+                    retour = l['date_retour_reelle'] if 'date_retour_reelle' in l.keys() else ''
+                    w.writerow([l['id'], l['date_location'], l['statut_loc'], l['marque'], l['modele'],
+                                l['immatriculation'], l['client'], l['date_debut'], l['date_fin'],
+                                retour or '', l['jours'], l['prix_jour'], l['total'], l['paiement']])
+            messagebox.showinfo("Export réussi", f"Fichier CSV créé :\n{path}")
+        except Exception as e:
+            messagebox.showerror("Erreur d'export", str(e))
 
     def add_location_dialog(self):
         dialog = Toplevel(self.root)
@@ -1221,6 +1604,14 @@ class Application:
                     photo_preview.image = None
         
         veh_combo.bind('<<ComboboxSelected>>', update_preview)
+
+        def on_veh_select(event):
+            selected = veh_combo.get()
+            if selected in veh_dict:
+                prix_entry.delete(0, END)
+                prix_entry.insert(0, str(veh_dict[selected]['prix_jour']))
+            calculer()
+        veh_combo.bind('<<ComboboxSelected>>', on_veh_select)
         
         fields = [('Client *', 'client'), ('Date location', 'date')]
         entries = {}
@@ -1237,18 +1628,30 @@ class Application:
         dates_frame.pack(fill=X, pady=15)
         
         date_entries = {}
+        today_d = datetime.now()
+        tomorrow_d = today_d + timedelta(days=1)
         for i, (label, key) in enumerate([('Date Début *', 'debut'), ('Date Fin *', 'fin')]):
             col = Frame(dates_frame)
             col.pack(side=LEFT, fill=X, expand=True, padx=(0 if i==0 else 10, 0))
             
             Label(col, text=label, font=('Segoe UI', 10)).pack(anchor='w')
             entry = Entry(col, font=('Segoe UI', 10), relief='solid', bd=1)
+            entry.insert(0, (today_d if i == 0 else tomorrow_d).strftime('%Y-%m-%d'))
             entry.pack(fill=X, ipady=4)
             date_entries[key] = entry
         
         Label(form, text="Prix/Jour (DH) : ", font=('Segoe UI', 11)).pack(anchor='w', pady=(15, 5))
         prix_entry = Entry(form, font=('Segoe UI', 12), relief='solid', bd=1)
         prix_entry.pack(fill=X, ipady=6)
+
+        Label(form, text="Acompte (DH) : ", font=('Segoe UI', 11)).pack(anchor='w', pady=(10, 5))
+        acompte_entry = Entry(form, font=('Segoe UI', 12), relief='solid', bd=1)
+        acompte_entry.insert(0, '0')
+        acompte_entry.pack(fill=X, ipady=6)
+
+        Label(form, text="Notes : ", font=('Segoe UI', 11)).pack(anchor='w', pady=(10, 5))
+        notes_txt = Text(form, font=('Segoe UI', 10), height=3, relief='solid', bd=1)
+        notes_txt.pack(fill=X)
         
         total_lbl = Label(form, text="Total : 0 DH", 
                          font=('Segoe UI', 14, 'bold'), fg=self.colors['primary'])
@@ -1258,19 +1661,24 @@ class Application:
             try:
                 d1 = datetime.strptime(date_entries['debut'].get(), '%Y-%m-%d')
                 d2 = datetime.strptime(date_entries['fin'].get(), '%Y-%m-%d')
-                jours = (d2 - d1).days
+                jours = max(1, (d2 - d1).days) if d2 > d1 else (d2 - d1).days
                 
                 prix_val = prix_entry.get().replace(',', '.')
                 prix = float(prix_val) if prix_val else 0.0
                 
-                total = max(0, jours) * prix
-                total_lbl.configure(text=f"Total : {total:,.0f} DH ({max(0, jours)} jours)")
-                return max(0, jours), total
+                j = max(0, jours) if d2 >= d1 else max(0, (d2 - d1).days)
+                total = j * prix
+                total_lbl.configure(text=f"Total : {total:,.0f} DH ({j} jours)")
+                return j, total
             except Exception:
                 total_lbl.configure(text="Total : Dates invalides")
                 return None, None
+
+        # Calcul automatique en temps réel
+        for e in list(date_entries.values()) + [prix_entry]:
+            e.bind('<KeyRelease>', lambda ev: calculer())
         
-        Button(form, text="📅 Calculer", command=calculer,
+        Button(form, text="📅 Recalculer", command=calculer,
                bg='#3498db', fg='white', font=('Segoe UI', 10),
                bd=0, padx=20, pady=8, cursor='hand2').pack(pady=10)
         
@@ -1280,10 +1688,43 @@ class Application:
         paiement.set('Espèces')
         paiement.pack(fill=X, ipady=4)
         
+        conflict_lbl = Label(form, text="", bg='white', fg=self.colors['danger'],
+                             font=('Segoe UI', 10, 'bold'))
+        conflict_lbl.pack(pady=(8, 0))
+
+        def check_conflict(*_):
+            selected = veh_combo.get()
+            if selected not in veh_dict:
+                conflict_lbl.configure(text="")
+                return False
+            try:
+                debut = date_entries['debut'].get()
+                fin = date_entries['fin'].get()
+                datetime.strptime(debut, '%Y-%m-%d')
+                datetime.strptime(fin, '%Y-%m-%d')
+            except Exception:
+                conflict_lbl.configure(text="")
+                return False
+            if self.db.has_date_conflict(veh_dict[selected]['id'], debut, fin):
+                conflict_lbl.configure(
+                    text=f"⛔ Conflit : ce véhicule est déjà loué sur cette période !")
+                return True
+            conflict_lbl.configure(text="✅ Véhicule disponible sur cette période",
+                                   fg=self.colors['secondary'])
+            return False
+
+        for e in list(date_entries.values()):
+            e.bind('<KeyRelease>', check_conflict)
+        veh_combo.bind('<<ComboboxSelected>>', check_conflict)
+        
         def save():
             jours, total = calculer()
             if jours is None:
                 messagebox.showerror("Erreur de date", "Veuillez vérifier le format (AAAA-MM-JJ).")
+                return
+            if jours <= 0:
+                messagebox.showerror("Erreur de date",
+                                     "La date de fin doit être postérieure à la date de début.")
                 return
             
             try:
@@ -1291,26 +1732,40 @@ class Application:
                 if not selected:
                     messagebox.showwarning("Attention", "Veuillez sélectionner un véhicule.")
                     return
-                
+
+                client = entries['client'].get().strip()
+                if not client:
+                    messagebox.showwarning("Attention", "Le nom du client est obligatoire.")
+                    return
+
+                if check_conflict():
+                    if not messagebox.askyesno(
+                            "Conflit de dates",
+                            "Ce véhicule est déjà loué sur cette période.\nForcer l'enregistrement ?"):
+                        return
+
                 prix_val = prix_entry.get().replace(',', '.')
+                acompte_val = acompte_entry.get().strip().replace(',', '.') or '0'
                 
                 data = {
                     'date': entries['date'].get(),
                     'vehicule_id': veh_dict[selected]['id'],
-                    'client': entries['client'].get(),
+                    'client': client,
                     'debut': date_entries['debut'].get(),
                     'fin': date_entries['fin'].get(),
                     'jours': jours,
                     'prix': float(prix_val) if prix_val else 0.0,
                     'total': total,
-                    'paiement': paiement.get()
+                    'paiement': paiement.get(),
+                    'acompte': float(acompte_val),
+                    'notes': notes_txt.get('1.0', END).strip() or None
                 }
                 self.db.add_location(data)
                 messagebox.showinfo("Succès", "Location enregistrée !")
                 dialog.destroy()
                 self.show_locations()
             except ValueError:
-                messagebox.showerror("Erreur", "Le prix doit être numérique.")
+                messagebox.showerror("Erreur", "Le prix et l'acompte doivent être numériques.")
             except Exception as e:
                 messagebox.showerror("Erreur", str(e))
         
@@ -1324,12 +1779,36 @@ class Application:
     # ============================================
     def show_charges(self):
         self.clear_main()
-        Label(self.main_frame, text="💰 Gestion des Charges", 
+
+        header = Frame(self.main_frame, bg=self.colors['bg'])
+        header.pack(fill=X)
+        Label(header, text="💰 Gestion des Charges",
               bg=self.colors['bg'], fg=self.colors['primary'],
-              font=('Segoe UI', 28, 'bold')).pack(pady=20)
+              font=('Segoe UI', 28, 'bold')).pack(side=LEFT, pady=(0, 20))
+
+        Button(header, text="+ Nouvelle charge variable",
+               command=self.add_variable_charge_dialog,
+               bg='#3498db', fg='white', font=('Segoe UI', 10),
+               bd=0, padx=15, pady=8, cursor='hand2').pack(side=RIGHT, pady=(0, 20))
+
+        total_fixes, total_vars, total_pers, total_all = self.db.get_total_charges()
+
+        synth = Frame(self.main_frame, bg='white', bd=1, relief='solid',
+                      highlightbackground='#e1e8ed', highlightthickness=1)
+        synth.pack(fill=X, pady=(0, 12))
+        inner = Frame(synth, bg='white')
+        inner.pack(fill=X, padx=20, pady=10)
+        for txt, val in [("Charges fixes :", f"{total_fixes:,.0f} DH".replace(',', ' ')),
+                         ("Charges variables :", f"{total_vars:,.0f} DH".replace(',', ' ')),
+                         ("Personnel :", f"{total_pers:,.0f} DH".replace(',', ' ')),
+                         ("TOTAL charges :", f"{total_all:,.0f} DH".replace(',', ' '))]:
+            Label(inner, text=txt, bg='white', fg='#7f8c8d',
+                  font=('Segoe UI', 11)).pack(side=LEFT, padx=(0, 6))
+            Label(inner, text=val, bg='white', fg=self.colors['danger'],
+                  font=('Segoe UI', 11, 'bold')).pack(side=LEFT, padx=(0, 25))
         
         notebook = ttk.Notebook(self.main_frame)
-        notebook.pack(fill=BOTH, expand=True, pady=20)
+        notebook.pack(fill=BOTH, expand=True, pady=10)
         
         tab_fixes = Frame(notebook, bg=self.colors['bg'])
         notebook.add(tab_fixes, text="   Charges Fixes    ")
@@ -1364,7 +1843,92 @@ class Application:
                 values = (row['date_charge'], vehicule_name, row['type'], f"{row['montant']:,.0f} DH", row['periode'] or '-')
             else:
                 values = (row['date_charge'], vehicule_name, row['type'], f"{row['montant']:,.0f} DH", row['description'] or '-')
-            tree.insert('', END, values=values)
+            tree.insert('', END, iid=str(row['id']), values=values)
+
+        # Suppression par touche Suppr
+        def on_delete(event):
+            sel = tree.selection()
+            if not sel:
+                return
+            if messagebox.askyesno("Confirmation", "Supprimer cette charge ?"):
+                if charge_type == 'fixe':
+                    self.db.conn.execute("DELETE FROM charges_fixes WHERE id=?", (sel[0],))
+                else:
+                    self.db.conn.execute("DELETE FROM charges_variables WHERE id=?", (sel[0],))
+                self.db.conn.commit()
+                self.show_charges()
+        tree.bind('<Delete>', on_delete)
+
+    def add_variable_charge_dialog(self):
+        dialog = Toplevel(self.root)
+        dialog.title("Ajouter une Charge Variable")
+        dialog.geometry("420x420")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        scroll_frame = ScrollableFrame(dialog, bg='#ffffff')
+        scroll_frame.pack(fill=BOTH, expand=True, padx=30, pady=20)
+        form = scroll_frame.scrollable_frame
+
+        Label(form, text="Date :", font=('Segoe UI', 11)).pack(anchor='w', pady=(5, 0))
+        date_entry = Entry(form, font=('Segoe UI', 11))
+        date_entry.insert(0, datetime.now().strftime('%Y-%m-%d'))
+        date_entry.pack(fill=X, pady=(0, 12))
+
+        Label(form, text="Véhicule concerné :", font=('Segoe UI', 11)).pack(anchor='w', pady=(0, 0))
+        vehicules = self.db.get_vehicules()
+        veh_labels = ['Général (sans véhicule)'] + [
+            f"{v['marque']} {v['modele']} ({v['immatriculation']})" for v in vehicules]
+        veh_combo = ttk.Combobox(form, values=veh_labels, state='readonly', font=('Segoe UI', 11))
+        veh_combo.current(0)
+        veh_combo.pack(fill=X, pady=(0, 12))
+
+        Label(form, text="Type (ex: Carburant, Réparation) :", font=('Segoe UI', 11)).pack(anchor='w')
+        type_entry = Entry(form, font=('Segoe UI', 11))
+        type_entry.pack(fill=X, pady=(0, 12))
+
+        Label(form, text="Montant (DH) :", font=('Segoe UI', 11)).pack(anchor='w')
+        montant_entry = Entry(form, font=('Segoe UI', 11))
+        montant_entry.pack(fill=X, pady=(0, 12))
+
+        Label(form, text="Description :", font=('Segoe UI', 11)).pack(anchor='w')
+        desc_entry = Entry(form, font=('Segoe UI', 11))
+        desc_entry.pack(fill=X, pady=(0, 20))
+
+        def save():
+            try:
+                montant_val = montant_entry.get().replace(',', '.')
+                montant = float(montant_val)
+                if montant <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Erreur", "Le montant doit être un nombre positif.")
+                return
+            if not type_entry.get().strip():
+                messagebox.showwarning("Attention", "Veuillez saisir le type de charge.")
+                return
+            veh_id = None
+            idx = veh_combo.current()
+            if idx > 0 and vehicules:
+                veh_id = vehicules[idx - 1]['id']
+            data = {
+                'date': date_entry.get(),
+                'vehicule_id': veh_id,
+                'type': type_entry.get().strip(),
+                'montant': montant,
+                'description': desc_entry.get().strip() or None
+            }
+            try:
+                self.db.add_charge_variable(data)
+                messagebox.showinfo("Succès", "Charge variable ajoutée !")
+                dialog.destroy()
+                self.show_charges()
+            except Exception as e:
+                messagebox.showerror("Erreur", str(e))
+
+        Button(form, text="✅ Enregistrer", command=save,
+               bg=self.colors['secondary'], fg='white', font=('Segoe UI', 11, 'bold'),
+               bd=0, padx=20, pady=10, cursor='hand2').pack()
 
     def add_fixed_charge_dialog(self):
         dialog = Toplevel(self.root)
@@ -1426,30 +1990,123 @@ class Application:
     # ============================================
     def show_personnel(self):
         self.clear_main()
-        Label(self.main_frame, text="👥 Charges Personnel", 
+
+        header = Frame(self.main_frame, bg=self.colors['bg'])
+        header.pack(fill=X)
+        Label(header, text="👥 Charges Personnel",
               bg=self.colors['bg'], fg=self.colors['primary'],
-              font=('Segoe UI', 28, 'bold')).pack(pady=20)
-        
-        tree = ttk.Treeview(self.main_frame, columns=('Date', 'Montant', 'Description'),
-                           show='headings', height=20)
-        for col in ('Date', 'Montant', 'Description'):
+              font=('Segoe UI', 28, 'bold')).pack(side=LEFT, pady=(0, 20))
+
+        Button(header, text="+ Ajouter une paie",
+               command=self.add_personnel_dialog,
+               bg=self.colors['secondary'], fg='white', font=('Segoe UI', 10),
+               bd=0, padx=15, pady=8, cursor='hand2').pack(side=RIGHT, pady=(0, 20))
+
+        tree = ttk.Treeview(self.main_frame,
+                            columns=('Date', 'Nom', 'Poste', 'Montant', 'Description'),
+                            show='headings', height=20)
+        for col in ('Date', 'Nom', 'Poste', 'Montant', 'Description'):
             tree.heading(col, text=col)
             tree.column(col, width=200)
-        tree.pack(fill=BOTH, expand=True, padx=20, pady=20)
-        
+        tree.pack(fill=BOTH, expand=True, padx=20, pady=(10, 5))
+
+        total_paies = 0
         for p in self.db.get_personnel():
-            tree.insert('', END, values=(p['date_paie'], f"{p['montant']:,.0f} DH", p['description'] or '-'))
+            keys = p.keys()
+            nom = p['nom'] if 'nom' in keys else None
+            poste = p['poste'] if 'poste' in keys else None
+            total_paies += p['montant'] or 0
+            tree.insert('', END, iid=str(p['id']),
+                        values=(p['date_paie'], nom or '-', poste or '-',
+                                f"{p['montant']:,.0f} DH", p['description'] or '-'))
+
+        Label(self.main_frame, text=f"💸 TOTAL paies : {total_paies:,.0f} DH".replace(',', ' '),
+              bg=self.colors['bg'], fg=self.colors['danger'],
+              font=('Segoe UI', 14, 'bold')).pack(anchor='e', padx=20, pady=(0, 15))
+
+        def on_delete(event):
+            sel = tree.selection()
+            if not sel:
+                return
+            if messagebox.askyesno("Confirmation", "Supprimer cette ligne de paie ?"):
+                self.db.delete_personnel(sel[0])
+                self.show_personnel()
+        tree.bind('<Delete>', on_delete)
+
+    def add_personnel_dialog(self):
+        dialog = Toplevel(self.root)
+        dialog.title("Ajouter une paie")
+        dialog.geometry("400x430")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        form = Frame(dialog, bg='white')
+        form.pack(fill=BOTH, expand=True, padx=30, pady=20)
+
+        Label(form, text="Date de paie :", font=('Segoe UI', 11)).pack(anchor='w', pady=(5, 0))
+        date_entry = Entry(form, font=('Segoe UI', 11))
+        date_entry.insert(0, datetime.now().strftime('%Y-%m-%d'))
+        date_entry.pack(fill=X, pady=(0, 12))
+
+        Label(form, text="Nom (optionnel) :", font=('Segoe UI', 11)).pack(anchor='w')
+        nom_entry = Entry(form, font=('Segoe UI', 11))
+        nom_entry.pack(fill=X, pady=(0, 12))
+
+        Label(form, text="Poste (optionnel) :", font=('Segoe UI', 11)).pack(anchor='w')
+        poste_entry = Entry(form, font=('Segoe UI', 11))
+        poste_entry.pack(fill=X, pady=(0, 12))
+
+        Label(form, text="Montant (DH) * :", font=('Segoe UI', 11)).pack(anchor='w')
+        montant_entry = Entry(form, font=('Segoe UI', 11))
+        montant_entry.pack(fill=X, pady=(0, 12))
+
+        Label(form, text="Description :", font=('Segoe UI', 11)).pack(anchor='w')
+        desc_entry = Entry(form, font=('Segoe UI', 11))
+        desc_entry.pack(fill=X, pady=(0, 20))
+
+        def save():
+            try:
+                montant = float(montant_entry.get().replace(',', '.'))
+                if montant <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Erreur", "Le montant doit être un nombre positif.")
+                return
+            data = {
+                'date': date_entry.get(),
+                'montant': montant,
+                'description': desc_entry.get().strip() or None,
+                'nom': nom_entry.get().strip() or None,
+                'poste': poste_entry.get().strip() or None,
+            }
+            try:
+                self.db.add_personnel(data)
+                messagebox.showinfo("Succès", "Paie enregistrée !")
+                dialog.destroy()
+                self.show_personnel()
+            except Exception as e:
+                messagebox.showerror("Erreur", str(e))
+
+        Button(form, text="✅ Enregistrer", command=save,
+               bg=self.colors['secondary'], fg='white', font=('Segoe UI', 11, 'bold'),
+               bd=0, padx=20, pady=10, cursor='hand2').pack()
 
     # ============================================
     # ALERTES
     # ============================================
     def show_alertes(self):
         self.clear_main()
-        
-        Label(self.main_frame, text="⚠️ Alertes Documents", 
+
+        header = Frame(self.main_frame, bg=self.colors['bg'])
+        header.pack(fill=X)
+        Label(header, text="⚠️ Alertes Documents",
               bg=self.colors['bg'], fg=self.colors['primary'],
-              font=('Segoe UI', 28, 'bold')).pack(anchor='w', pady=(0, 20))
-        
+              font=('Segoe UI', 28, 'bold')).pack(side=LEFT, pady=(0, 20))
+
+        Button(header, text="📄 Export CSV", command=self.export_alertes_csv,
+               bg='#3498db', fg='white', font=('Segoe UI', 10),
+               bd=0, padx=15, pady=8, cursor='hand2').pack(side=RIGHT, pady=(0, 20))
+
         alertes = self.db.get_alertes()
         
         if not alertes:
